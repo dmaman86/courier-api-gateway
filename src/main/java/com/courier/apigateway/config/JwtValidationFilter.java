@@ -1,6 +1,8 @@
 package com.courier.apigateway.config;
 
 import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.List;
 import java.util.Optional;
 
 import org.slf4j.Logger;
@@ -8,7 +10,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
-import org.springframework.core.Ordered;
 import org.springframework.http.HttpCookie;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
@@ -16,6 +17,8 @@ import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.stereotype.Component;
 import org.springframework.web.server.ServerWebExchange;
 
+import com.courier.apigateway.exceptions.PublicKeyException;
+import com.courier.apigateway.exceptions.TokenValidationException;
 import com.courier.apigateway.objects.dto.ErrorLogDto;
 import com.courier.apigateway.objects.dto.SecurityEventDto;
 import com.courier.apigateway.objects.enums.ErrorSeverity;
@@ -27,7 +30,7 @@ import com.courier.apigateway.service.RedisKeysService;
 import reactor.core.publisher.Mono;
 
 @Component
-public class JwtValidationFilter implements GlobalFilter, Ordered {
+public class JwtValidationFilter implements GlobalFilter {
 
   private static final Logger logger = LoggerFactory.getLogger(JwtValidationFilter.class);
 
@@ -35,60 +38,75 @@ public class JwtValidationFilter implements GlobalFilter, Ordered {
 
   @Autowired private JwtService jwtService;
 
-  @Autowired private RedisKeysService redisKeysService;
-
   @Autowired private EventProducerService eventProducerService;
 
-  @Autowired private RouterValidator routerValidator;
+  @Autowired private RedisKeysService redisKeysService;
+
+  private static final List<String> OPEN_ENDPOINTS =
+      List.of("/api/auth/signin", "/api/auth/signup");
+
+  private static final String REFRESH_TOKEN_ENDPOINT = "/api/credential/refresh-token";
 
   @Override
   public Mono<Void> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
 
-    if (redisKeysService.getPublicKey() == null) {
+    if (!redisKeysService.hasValidPublicKey()) {
       return unauthorizedResponse(exchange, "Public key is not available");
     }
 
-    ServerHttpRequest request = exchange.getRequest();
-    String requestPath = request.getURI().getPath();
+    if (!isOpenEndpoint(exchange.getRequest())) {
+      ServerHttpRequest request = exchange.getRequest();
+      String requestPath = request.getURI().getPath();
+      try {
+        String token =
+            (requestPath.equals(REFRESH_TOKEN_ENDPOINT))
+                ? extractTokenFromCookies(request, "refreshToken")
+                : extractTokenFromCookies(request, "accessToken");
 
-    if (!routerValidator.isSecured.test(request)) {
-      return chain.filter(exchange);
+        if (token == null || token.isEmpty() || !jwtService.isTokenValid(token)) {
+          return unauthorizedResponse(exchange, "Invalid token");
+        }
+
+        String clientUserAgent = request.getHeaders().getFirst(HttpHeaders.USER_AGENT);
+
+        SecurityEventDto securityEventDto = jwtService.getSecurityEvent(token);
+
+        if (blackListService.isUserBlackListed(securityEventDto.getUserId())) {
+          sendSecurityAlert(securityEventDto, requestPath, "User in blacklisted");
+          return unauthorizedResponse(exchange, "User is not authorized");
+        }
+
+        if (isSuspiciousRequest(securityEventDto, clientUserAgent)) {
+          logger.warn(
+              "Detected malicious request from user: {} with ip: {} and user agent: {}",
+              securityEventDto.getUserId(),
+              clientUserAgent);
+          blackListService.handleUserIdEvent(securityEventDto.getUserId());
+          sendSecurityAlert(securityEventDto, requestPath, "User agent mismatch");
+          return unauthorizedResponse(exchange, "Detected malicious request");
+        }
+
+        return chain.filter(exchange);
+
+      } catch (TokenValidationException e) {
+        logger.warn("Token validation exception: {}", e.getMessage());
+        return unauthorizedResponse(exchange, e.getMessage());
+      } catch (PublicKeyException e) {
+        logger.error("Public key exception: {}", e.getMessage());
+        return unauthorizedResponse(exchange, e.getMessage());
+      } catch (RuntimeException e) {
+        logger.error("Runtime exception: {}", e.getMessage());
+        return unauthorizedResponse(exchange, e.getMessage());
+      }
     }
-
-    String token = extractTokenFromCookies(request);
-    if (token == null || token.isEmpty() || !jwtService.isTokenValid(token)) {
-      return unauthorizedResponse(exchange, "Invalid token");
-    }
-
-    String clientIp = getClientIp(request);
-    String clientUserAgent = request.getHeaders().getFirst(HttpHeaders.USER_AGENT);
-
-    SecurityEventDto securityEventDto = jwtService.getSecurityEvent(token);
-
-    if (blackListService.isUserBlackListed(securityEventDto.getUserId())) {
-      sendSecurityAlert(securityEventDto, requestPath, "User in blacklisted");
-      return unauthorizedResponse(exchange, "User is not authorized");
-    }
-
-    if (isSuspiciousRequest(securityEventDto, clientIp, clientUserAgent)) {
-      logger.warn(
-          "Detected malicious request from user: {} with ip: {} and user agent: {}",
-          securityEventDto.getUserId(),
-          clientIp,
-          clientUserAgent);
-      blackListService.handleUserIdEvent(securityEventDto.getUserId());
-      eventProducerService.sendUserIdBlacklist(securityEventDto.getUserId());
-      sendSecurityAlert(securityEventDto, requestPath, "User ip or user agent mismatch");
-      return unauthorizedResponse(exchange, "Detected malicious request");
-    }
-
     return chain.filter(exchange);
   }
 
   private void sendSecurityAlert(SecurityEventDto securityEventDto, String path, String reason) {
     ErrorLogDto errorLog =
         ErrorLogDto.builder()
-            .timestamp(LocalDateTime.now())
+            .timestamp(
+                LocalDateTime.now().format(DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")))
             .status(401) // Unauthorized
             .error("Malicious Request Detected")
             .message(
@@ -103,7 +121,7 @@ public class JwtValidationFilter implements GlobalFilter, Ordered {
             .severity(ErrorSeverity.CRITICAL)
             .build();
 
-    eventProducerService.sendErrorLog(errorLog);
+    eventProducerService.publishErrorLog(errorLog);
     logger.warn("Security alert event send to error-service: {}", errorLog);
   }
 
@@ -112,10 +130,10 @@ public class JwtValidationFilter implements GlobalFilter, Ordered {
     return exchange.getResponse().setComplete();
   }
 
-  private String getClientIp(ServerHttpRequest request) {
-    return Optional.ofNullable(request.getHeaders().getFirst("X-Forwarded-For"))
-        .map(ip -> ip.split(",")[0])
-        .orElseGet(() -> request.getRemoteAddress().getAddress().getHostAddress());
+  private String extractTokenFromCookies(ServerHttpRequest request, String cookieName) {
+    return Optional.ofNullable(request.getCookies().getFirst(cookieName))
+        .map(HttpCookie::getValue)
+        .orElse(null);
   }
 
   private String extractTokenFromCookies(ServerHttpRequest request) {
@@ -124,14 +142,15 @@ public class JwtValidationFilter implements GlobalFilter, Ordered {
         .orElse(null);
   }
 
-  private boolean isSuspiciousRequest(
-      SecurityEventDto securityEventDto, String clientIp, String clientUserAgent) {
-    return !securityEventDto.getIp().equals(clientIp)
-        || !securityEventDto.getUserAgent().equals(clientUserAgent);
+  private boolean isSuspiciousRequest(SecurityEventDto securityEventDto, String clientUserAgent) {
+    return !securityEventDto.getUserAgent().equals(clientUserAgent);
   }
 
-  @Override
-  public int getOrder() {
-    return -10;
+  private boolean isOpenEndpoint(ServerHttpRequest request) {
+    String path = request.getURI().getPath();
+    boolean isOpen = OPEN_ENDPOINTS.stream().anyMatch(path::startsWith);
+
+    logger.info("Path: {} is open: {}", path, isOpen);
+    return isOpen;
   }
 }

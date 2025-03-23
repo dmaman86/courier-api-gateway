@@ -82,10 +82,8 @@ This includes **rate limiting (Redis), token validation, and security event hand
 @Configuration
 public class GatewayConfig {
 
-  @Autowired private RedisRateLimiter redisRateLimiter;
-
   @Bean
-  public RouteLocator routes(RouteLocatorBuilder builder) {
+  public RouteLocator routes(RouteLocatorBuilder builder, RedisRateLimiter redisRateLimiter) {
     return builder
         .routes()
         .route(
@@ -128,6 +126,11 @@ public class GatewayConfig {
   public KeyResolver ipKeyResolver() {
     return exchange ->
         Mono.just(exchange.getRequest().getRemoteAddress().getAddress().getHostAddress());
+  }
+
+  @Bean
+  public RedisRateLimiter redisRateLimiter() {
+    return new RedisRateLimiter(10, 20);
   }
 }
 ```

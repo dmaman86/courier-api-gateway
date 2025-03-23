@@ -4,7 +4,7 @@ public interface BlackListService {
 
   void handleUserIdEvent(Long userId);
 
-  void cleanExpiredBlackList();
+  // void cleanExpiredBlackList();
 
   boolean isUserBlackListed(Long userId);
 }

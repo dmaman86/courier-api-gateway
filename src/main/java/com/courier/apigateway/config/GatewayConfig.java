@@ -1,6 +1,5 @@
 package com.courier.apigateway.config;
 
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.cloud.gateway.filter.ratelimit.KeyResolver;
 import org.springframework.cloud.gateway.filter.ratelimit.RedisRateLimiter;
 import org.springframework.cloud.gateway.route.RouteLocator;
@@ -13,10 +12,8 @@ import reactor.core.publisher.Mono;
 @Configuration
 public class GatewayConfig {
 
-  @Autowired private RedisRateLimiter redisRateLimiter;
-
   @Bean
-  public RouteLocator routes(RouteLocatorBuilder builder) {
+  public RouteLocator routes(RouteLocatorBuilder builder, RedisRateLimiter redisRateLimiter) {
     return builder
         .routes()
         .route(
@@ -59,5 +56,10 @@ public class GatewayConfig {
   public KeyResolver ipKeyResolver() {
     return exchange ->
         Mono.just(exchange.getRequest().getRemoteAddress().getAddress().getHostAddress());
+  }
+
+  @Bean
+  public RedisRateLimiter redisRateLimiter() {
+    return new RedisRateLimiter(10, 20);
   }
 }

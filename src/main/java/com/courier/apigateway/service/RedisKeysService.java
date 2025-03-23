@@ -1,12 +1,12 @@
 package com.courier.apigateway.service;
 
-import com.courier.apigateway.objects.dto.AuthInfoDto;
+import java.util.List;
 
 public interface RedisKeysService {
 
-  void saveKeys(AuthInfoDto authInfoDto);
-
   String getPublicKey();
+
+  List<String> getPublicKeys();
 
   String getAuthServiceSecret();
 
